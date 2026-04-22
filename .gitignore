@@ -1,0 +1,15 @@
+__pycache__/
+*.pyc
+*.pyo
+
+outputs/
+
+*.wav
+*.mp3
+*.flac
+
+.env
+*.log
+
+.vscode/
+.idea/
