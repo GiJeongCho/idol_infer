@@ -134,13 +134,24 @@ async def download_output(filename: str):
 # -- helper --
 
 def _handle_model_switch(model: Optional[str]):
-    if model and model != engine.model_name:
-        try:
-            engine.switch_model(model)
-        except FileNotFoundError:
-            raise HTTPException(404, f"Model not found: {model}")
-        except Exception as e:
-            raise HTTPException(400, f"Failed to switch model: {e}")
+    global engine
+    if model:
+        if engine is None:
+            logger.info("Lazy-loading engine with model: %s", model)
+            engine = RVCEngine(
+                rvc_root=RVC_ROOT,
+                model_name=model,
+                device="cuda:0",
+                is_half=False,
+            )
+            engine.load()
+        elif model != engine.model_name:
+            try:
+                engine.switch_model(model)
+            except FileNotFoundError:
+                raise HTTPException(404, f"Model not found: {model}")
+            except Exception as e:
+                raise HTTPException(400, f"Failed to switch model: {e}")
 
 
 def _save_tmp(upload: UploadFile, content: bytes, label: str, run_id: str) -> str:
@@ -182,10 +193,10 @@ async def convert(
     - vocal_volume: converted vocal volume multiplier
     - bg_volume: background music volume multiplier
     """
-    if engine is None or not engine.ready:
-        raise HTTPException(503, "Model not loaded yet")
-
     _handle_model_switch(model)
+
+    if engine is None or not engine.ready:
+        raise HTTPException(503, "Model not loaded yet. Specify 'model' parameter.")
 
     run_id = uuid.uuid4().hex[:8]
     vocal_content = await vocal.read()

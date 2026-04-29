@@ -11,5 +11,7 @@ outputs/
 .env
 *.log
 
+nohup.out
+
 .vscode/
 .idea/
