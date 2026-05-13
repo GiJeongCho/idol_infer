@@ -32,12 +32,12 @@ import logging
 import tempfile
 import uuid
 from contextlib import asynccontextmanager
-from typing import Optional
+from typing import List, Optional
 
 import numpy as np
 import soundfile as sf
 import uvicorn
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
 from fastapi.responses import FileResponse
 
 from engine import RVCEngine
@@ -164,65 +164,66 @@ def _save_tmp(upload: UploadFile, content: bytes, label: str, run_id: str) -> st
 
 # -- core API --
 
-@app.post("/convert")
-async def convert(
-    vocal: UploadFile = File(..., description="vocals audio file"),
-    bg: UploadFile = File(..., description="background music audio file"),
-    model: Optional[str] = Form(None),
-    f0_up_key: int = Form(0),
-    f0_method: str = Form("rmvpe"),
-    index_rate: float = Form(0.0),
-    filter_radius: int = Form(3),
-    rms_mix_rate: float = Form(0.25),
-    protect: float = Form(0.33),
-    vocal_volume: float = Form(1.0),
-    bg_volume: float = Form(1.0),
+async def _do_convert(
+    vocal: UploadFile,
+    bg_files: list,
+    model, f0_up_key, f0_method, index_rate, filter_radius,
+    rms_mix_rate, protect, vocal_volume, bg_volume,
 ):
-    """
-    vocal(singing voice) + bg(background music) -> RVC converted vocal + bg mixed output
-
-    - vocal: vocal/singing audio file
-    - bg: background music/instrumental audio file
-    - model: RVC model filename (e.g. Ralo_e200_s200.pth)
-    - f0_up_key: pitch shift in semitones (-12 ~ +12)
-    - f0_method: pitch extraction (rmvpe / pm / harvest / crepe)
-    - index_rate: index mix ratio (0.0 ~ 1.0)
-    - filter_radius: median filter radius for harvest
-    - rms_mix_rate: RMS mix ratio (0.0 ~ 1.0)
-    - protect: consonant protection (0.0 ~ 0.5)
-    - vocal_volume: converted vocal volume multiplier
-    - bg_volume: background music volume multiplier
-    """
     _handle_model_switch(model)
-
     if engine is None or not engine.ready:
         raise HTTPException(503, "Model not loaded yet. Specify 'model' parameter.")
 
     run_id = uuid.uuid4().hex[:8]
-    vocal_content = await vocal.read()
-    bg_content = await bg.read()
-
-    tmp_vocal = _save_tmp(vocal, vocal_content, "vocal", run_id)
-    tmp_bg = _save_tmp(bg, bg_content, "bg", run_id)
-
-    vocal_basename = os.path.splitext(vocal.filename or "vocal")[0]
-    out_name = f"{vocal_basename}_{engine.model_name.replace('.pth','')}_{run_id}.wav"
-    out_path = os.path.join(OUTPUT_DIR, out_name)
+    tmp_paths = []
 
     try:
-        info = engine.convert_and_mix(
-            vocal_path=tmp_vocal,
-            bg_path=tmp_bg,
-            output_path=out_path,
-            f0_up_key=f0_up_key,
-            f0_method=f0_method,
-            index_rate=index_rate,
-            filter_radius=filter_radius,
-            rms_mix_rate=rms_mix_rate,
-            protect=protect,
-            vocal_volume=vocal_volume,
-            bg_volume=bg_volume,
-        )
+        vocal_content = await vocal.read()
+        tmp_vocal = _save_tmp(vocal, vocal_content, "vocal", run_id)
+        tmp_paths.append(tmp_vocal)
+
+        tmp_bg_paths = []
+        for i, bg_file in enumerate(bg_files):
+            bg_content = await bg_file.read()
+            suffix = os.path.splitext(bg_file.filename or "bg.wav")[1] or ".wav"
+            bg_path = os.path.join(tempfile.gettempdir(), f"rvc_bg{i}_{run_id}{suffix}")
+            with open(bg_path, "wb") as f:
+                f.write(bg_content)
+            tmp_bg_paths.append(bg_path)
+            tmp_paths.append(bg_path)
+
+        vocal_basename = os.path.splitext(vocal.filename or "vocal")[0]
+        out_name = f"{vocal_basename}_{engine.model_name.replace('.pth','')}_{run_id}.wav"
+        out_path = os.path.join(OUTPUT_DIR, out_name)
+
+        if tmp_bg_paths:
+            info = engine.convert_and_mix(
+                vocal_path=tmp_vocal,
+                bg_paths=tmp_bg_paths,
+                output_path=out_path,
+                f0_up_key=f0_up_key,
+                f0_method=f0_method,
+                index_rate=index_rate,
+                filter_radius=filter_radius,
+                rms_mix_rate=rms_mix_rate,
+                protect=protect,
+                vocal_volume=vocal_volume,
+                bg_volume=bg_volume,
+            )
+        else:
+            info, (sr, converted_vocal) = engine.convert(
+                input_audio_path=tmp_vocal,
+                f0_up_key=f0_up_key,
+                f0_method=f0_method,
+                index_rate=index_rate,
+                filter_radius=filter_radius,
+                rms_mix_rate=rms_mix_rate,
+                protect=protect,
+            )
+            if sr is None or converted_vocal is None:
+                raise RuntimeError(f"RVC conversion failed: {info}")
+            sf.write(out_path, converted_vocal, sr)
+
         safe_info = info.replace("\n", " | ")
         return FileResponse(out_path, media_type="audio/wav", filename=out_name,
                             headers={"X-RVC-Info": safe_info})
@@ -232,9 +233,57 @@ async def convert(
         logger.exception("Conversion error")
         raise HTTPException(500, str(e))
     finally:
-        for p in (tmp_vocal, tmp_bg):
+        for p in tmp_paths:
             if os.path.exists(p):
                 os.remove(p)
+
+
+@app.post("/convert", summary="Voice conversion (vocal only or with bg via curl)")
+async def convert(
+    vocal: UploadFile = File(..., description="vocals audio file"),
+    model: Optional[str] = Form(None, description="RVC model filename"),
+    f0_up_key: int = Form(0, description="pitch shift in semitones (-12 ~ +12)"),
+    f0_method: str = Form("rmvpe", description="pitch extraction: rmvpe / pm / harvest / crepe"),
+    index_rate: float = Form(0.0, description="index mix ratio (0.0 ~ 1.0)"),
+    filter_radius: int = Form(3, description="median filter radius for harvest"),
+    rms_mix_rate: float = Form(0.25, description="RMS mix ratio (0.0 ~ 1.0)"),
+    protect: float = Form(0.33, description="consonant protection (0.0 ~ 0.5)"),
+    vocal_volume: float = Form(1.0, description="converted vocal volume multiplier"),
+    bg_volume: float = Form(1.0, description="background music volume multiplier"),
+):
+    """
+    Voice conversion. For bg tracks, use /convert_mix or curl:
+    `curl -F 'vocal=@v.wav' -F 'bg=@kick.wav' -F 'bg=@bass.wav' ...`
+    """
+    return await _do_convert(
+        vocal, [], model, f0_up_key, f0_method, index_rate,
+        filter_radius, rms_mix_rate, protect, vocal_volume, bg_volume,
+    )
+
+
+@app.post("/convert_mix", summary="Voice conversion + background mixing")
+async def convert_mix(
+    vocal: UploadFile = File(..., description="vocals audio file"),
+    bg: List[UploadFile] = File(..., description="background music files (multiple: kick, drum, bass, etc.)"),
+    model: Optional[str] = Form(None, description="RVC model filename"),
+    f0_up_key: int = Form(0, description="pitch shift in semitones (-12 ~ +12)"),
+    f0_method: str = Form("rmvpe", description="pitch extraction: rmvpe / pm / harvest / crepe"),
+    index_rate: float = Form(0.0, description="index mix ratio (0.0 ~ 1.0)"),
+    filter_radius: int = Form(3, description="median filter radius for harvest"),
+    rms_mix_rate: float = Form(0.25, description="RMS mix ratio (0.0 ~ 1.0)"),
+    protect: float = Form(0.33, description="consonant protection (0.0 ~ 0.5)"),
+    vocal_volume: float = Form(1.0, description="converted vocal volume multiplier"),
+    bg_volume: float = Form(1.0, description="background music volume multiplier"),
+):
+    """
+    Voice conversion + mix with background tracks.
+    bg accepts multiple files - they are all summed together.
+    """
+    bg_files = [f for f in bg if isinstance(f, UploadFile) and f.filename]
+    return await _do_convert(
+        vocal, bg_files, model, f0_up_key, f0_method, index_rate,
+        filter_radius, rms_mix_rate, protect, vocal_volume, bg_volume,
+    )
 
 
 # -- training API --

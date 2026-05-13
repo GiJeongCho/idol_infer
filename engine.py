@@ -186,7 +186,7 @@ class RVCEngine:
     def convert_and_mix(
         self,
         vocal_path: str,
-        bg_path: str,
+        bg_paths: list[str],
         output_path: str,
         f0_up_key: int = 0,
         f0_method: str = "rmvpe",
@@ -199,10 +199,10 @@ class RVCEngine:
         bg_volume: float = 1.0,
     ) -> str:
         """
-        vocal + bg -> RVC(vocal) + bg mixed output.
+        vocal + bg(s) -> RVC(vocal) + mixed bg output.
 
-        1. RVC converts the vocal track
-        2. Mix converted vocal with background music
+        bg_paths can contain multiple files (kick, drum, bass, etc.)
+        which are all summed together before mixing with the converted vocal.
 
         Returns info string on success, raises on failure.
         """
@@ -225,8 +225,8 @@ class RVCEngine:
         if sr is None or converted_vocal is None:
             raise RuntimeError(f"RVC conversion failed: {info}")
 
-        logger.info("Step 2/2: Mixing converted vocals with background")
-        self._remix(converted_vocal, sr, bg_path, output_path, vocal_volume, bg_volume)
+        logger.info("Step 2/2: Mixing converted vocals with %d background track(s)", len(bg_paths))
+        self._remix(converted_vocal, sr, bg_paths, output_path, vocal_volume, bg_volume)
 
         logger.info("Done -> %s", output_path)
         return info
@@ -237,28 +237,37 @@ class RVCEngine:
         self,
         converted_vocal: np.ndarray,
         vocal_sr: int,
-        bg_path: str,
+        bg_paths: list[str],
         output_path: str,
         vocal_volume: float = 1.0,
         bg_volume: float = 1.0,
     ):
-        """Mix converted vocals (int16) with background audio and save."""
+        """Mix converted vocals (int16) with one or more background tracks and save."""
         import librosa
 
-        bg_audio, bg_sr = sf.read(bg_path, dtype="float32")
-        if bg_audio.ndim == 2:
-            bg_audio = bg_audio.mean(axis=1)
-
-        if bg_sr != vocal_sr:
-            bg_audio = librosa.resample(bg_audio, orig_sr=bg_sr, target_sr=vocal_sr)
-
         vocal_float = converted_vocal.astype(np.float32) / 32768.0
+        max_len = len(vocal_float)
 
-        min_len = min(len(vocal_float), len(bg_audio))
-        vocal_float = vocal_float[:min_len]
-        bg_audio = bg_audio[:min_len]
+        bg_tracks = []
+        for bg_path in bg_paths:
+            bg_audio, bg_sr = sf.read(bg_path, dtype="float32")
+            if bg_audio.ndim == 2:
+                bg_audio = bg_audio.mean(axis=1)
+            if bg_sr != vocal_sr:
+                bg_audio = librosa.resample(bg_audio, orig_sr=bg_sr, target_sr=vocal_sr)
+            max_len = max(max_len, len(bg_audio))
+            bg_tracks.append(bg_audio)
 
-        mixed = vocal_float * vocal_volume + bg_audio * bg_volume
+        mixed = np.zeros(max_len, dtype=np.float32)
+
+        if len(vocal_float) < max_len:
+            vocal_float = np.pad(vocal_float, (0, max_len - len(vocal_float)))
+        mixed += vocal_float * vocal_volume
+
+        for bg in bg_tracks:
+            if len(bg) < max_len:
+                bg = np.pad(bg, (0, max_len - len(bg)))
+            mixed += bg * bg_volume
 
         peak = np.abs(mixed).max()
         if peak > 0.99:
