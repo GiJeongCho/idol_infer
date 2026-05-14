@@ -115,6 +115,20 @@ class RVCEngine:
         self._load_rvc_model(model_name)
         logger.info("Switched to model: %s", model_name)
 
+    def _find_index_file(self) -> str:
+        """Auto-find a .index file for the current model in logs/<exp_name>/."""
+        exp_name = self.model_name.replace(".pth", "")
+        for base in (exp_name, exp_name.split("_")[0]):
+            index_dir = os.path.join(self.rvc_root, "logs", base)
+            if os.path.isdir(index_dir):
+                candidates = sorted(
+                    f for f in os.listdir(index_dir)
+                    if f.endswith(".index") and not f.startswith("trained_")
+                )
+                if candidates:
+                    return os.path.join(index_dir, candidates[0])
+        return ""
+
     def convert(
         self,
         input_audio_path: str,
@@ -136,6 +150,11 @@ class RVCEngine:
         """
         if not self.ready:
             return "Engine not loaded", (None, None)
+
+        if not file_index and index_rate > 0:
+            file_index = self._find_index_file()
+            if file_index:
+                logger.info("Auto-detected index file: %s", file_index)
 
         try:
             audio = load_audio(input_audio_path, 16000)
